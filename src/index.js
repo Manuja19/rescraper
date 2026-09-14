@@ -10,20 +10,24 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
     // ==========================================
-    // ROUTE 1: /api/proxy (Streams video securely over HTTPS)
+    // ROUTE 1: /api/proxy (Streams IP-restricted MP4s securely)
     // ==========================================
     if (url.pathname === '/api/proxy') {
       const targetUrl = url.searchParams.get('url');
-      if (!targetUrl) {
-        return new Response('Missing url parameter', { status: 400, headers: corsHeaders });
+      
+      // Security: Only allow proxying requests to animegg.org play endpoints
+      if (!targetUrl || !targetUrl.startsWith('https://www.animegg.org/play/')) {
+        return new Response(JSON.stringify({ error: 'Invalid video URL' }), { 
+          status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
       }
 
       const fetchHeaders = new Headers({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.animegg.org/',
+        'Referer': 'https://www.animegg.org/', // Crucial for the ?for= token validation
       });
       
-      // Forward Range headers for video seeking
+      // Forward Range headers for video seeking (scrubbing)
       if (request.headers.get('Range')) {
         fetchHeaders.set('Range', request.headers.get('Range'));
       }
@@ -43,7 +47,9 @@ export default {
         responseHeaders.set('Content-Range', response.headers.get('Content-Range'));
       }
       responseHeaders.set('Accept-Ranges', 'bytes');
+      responseHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
 
+      // Stream the response body directly (highly efficient in Cloudflare)
       return new Response(response.body, {
         status: response.status,
         headers: responseHeaders,
@@ -51,7 +57,7 @@ export default {
     }
 
     // ==========================================
-    // ROUTE 2: /api/m3u8 (Generates HLS Playlist)
+    // ROUTE 2: /api/m3u8 (Generates HLS Master Playlist)
     // ==========================================
     if (url.pathname === '/api/m3u8') {
       const urlsParam = url.searchParams.get('urls');
@@ -162,50 +168,23 @@ export default {
           
           if (!sourcesMatch) return { sources: [], errors: ['videoSources variable not found in embed HTML'] };
 
-          const regex = /\{file:\s*"([^"]+)",\s*label:\s*"([^"]+)",\s*bk:\s*"([^"]*)"/g;
+          // Extract the DIRECT .mp4 file path and label
+          const regex = /\{file:\s*"([^"]+)",\s*label:\s*"([^"]+)"/g;
           let match;
           while ((match = regex.exec(sourcesMatch[1])) !== null) {
-            const base64Bk = match[3];
+            const filePath = match[1];
             const label = match[2];
-            if (!base64Bk) {
-              errors.push(`${label}: bk field is empty`);
-              continue;
-            }
 
             try {
-              const decodedBk = atob(base64Bk);
-              let finalUrl = decodeURIComponent(decodedBk);
-
-              // Check if it's a known HTML embed page
-              const isEmbedPage = finalUrl.includes('mp4upload.com') || finalUrl.includes('streamtape.com') || finalUrl.includes('doodstream.com') || finalUrl.includes('mixdrop.co') || finalUrl.includes('.html');
-
-              if (!isEmbedPage) {
-                // It's a direct CDN link! Proxy it through our worker to ensure HTTPS and bypass CORS/Mixed Content.
-                const proxiedUrl = `https://${host}/api/proxy?url=${encodeURIComponent(finalUrl)}`;
-                sources.push({ resolution: label, url: proxiedUrl });
-              } else {
-                // It's an HTML embed page, scrape it for the real MP4
-                const embedPageResponse = await fetch(finalUrl, {
-                  headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': 'https://www.animegg.org/' }
-                });
-                if (embedPageResponse.ok) {
-                  const embedPageHtml = await embedPageResponse.text();
-                  if (embedPageHtml.includes('File was deleted')) {
-                    errors.push(`${label}: File deleted on third-party host`);
-                    continue;
-                  }
-                  const mp4Match = embedPageHtml.match(/(?:file|src|url):\s*["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i);
-                  if (mp4Match && mp4Match[1]) {
-                    sources.push({ resolution: label, url: mp4Match[1] });
-                  } else {
-                    errors.push(`${label}: Could not extract mp4 from embed page`);
-                  }
-                } else {
-                  errors.push(`${label}: Third-party embed fetch failed: ${embedPageResponse.status}`);
-                }
-              }
+              // Construct the full, IP-restricted URL
+              const directUrl = `https://www.animegg.org${filePath}`;
+              
+              // Wrap it in our Cloudflare proxy to bypass the IP restriction and CORS
+              const proxiedUrl = `https://${host}/api/proxy?url=${encodeURIComponent(directUrl)}`;
+              
+              sources.push({ resolution: label, url: proxiedUrl });
             } catch (e) {
-              errors.push(`${label}: Decode failed - ${e.message}`);
+              errors.push(`${label}: Processing failed - ${e.message}`);
             }
           }
           return { sources, errors };
