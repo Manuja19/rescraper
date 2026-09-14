@@ -15,11 +15,13 @@ export async function getMedia(id: number | string) {
       }
     }
   `;
+  
   const res = await fetch('https://graphql.anilist.co', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
+      'User-Agent': UA, // ✅ This fixes the 403 error
     },
     body: JSON.stringify({
       query,
